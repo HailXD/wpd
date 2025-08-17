@@ -14,8 +14,6 @@
 // @grant        unsafeWindow
 // @connect      *
 // @run-at       document-start
-// @downloadURL https://update.greasyfork.org/scripts/545041/Wplace%20Overlay%20Pro.user.js
-// @updateURL https://update.greasyfork.org/scripts/545041/Wplace%20Overlay%20Pro.meta.js
 // ==/UserScript==
 
 (function () {
@@ -885,9 +883,11 @@
             </div>
           </div>
           <div id="op-colors-body">
-            <div class="op-row" style="gap: 6px;">
+            <div class="op-row" style="gap: 6px; flex-wrap: wrap;">
               <button class="op-button" id="op-colors-all">All</button>
               <button class="op-button" id="op-colors-none">None</button>
+              <button class="op-button" id="op-colors-free">All Free</button>
+              <button class="op-button" id="op-colors-paid">All Paid</button>
             </div>
             <div class="op-list" id="op-colors-list" style="max-height: 140px; gap: 4px;"></div>
           </div>
@@ -941,7 +941,7 @@
 
   async function addBlankOverlay() {
     const name = uniqueName('Overlay');
-    const ov = { id: uid(), name, enabled: true, imageUrl: null, imageBase64: null, isLocal: false, pixelUrl: null, offsetX: 0, offsetY: 0, opacity: 0.7, visibleColorKeys: null };
+    const ov = { id: uid(), name, enabled: true, imageUrl: null, imageBase64: null, isLocal: false, pixelUrl: null, offsetX: 0, offsetY: 0, opacity: 0.7, visibleColorKeys: [] };
     config.overlays.push(ov);
     config.activeOverlayId = ov.id;
     await saveConfig(['overlays', 'activeOverlayId']);
@@ -982,7 +982,7 @@
       if (!imageUrl) { failed++; continue; }
       try {
         const base64 = await urlToDataURL(imageUrl);
-        const ov = { id: uid(), name, enabled: true, imageUrl, imageBase64: base64, isLocal: false, pixelUrl, offsetX, offsetY, opacity, visibleColorKeys: null };
+        const ov = { id: uid(), name, enabled: true, imageUrl, imageBase64: base64, isLocal: false, pixelUrl, offsetX, offsetY, opacity, visibleColorKeys: [] };
         config.overlays.push(ov); imported++;
       } catch (e) { console.error('Import failed for', imageUrl, e); failed++; }
     }
@@ -1041,6 +1041,30 @@
         const ov = getActiveOverlay();
         if (!ov) return;
         ov.visibleColorKeys = [];
+        await saveConfig(['overlays']);
+        clearOverlayCache();
+        await updateColorDistributionUI();
+    });
+
+    $('op-colors-free').addEventListener('click', async () => {
+        const ov = getActiveOverlay();
+        if (!ov) return;
+        const counts = await getOverlayColorDistribution(ov);
+        const allColorKeys = Object.keys(counts);
+        const freeKeys = new Set(WPLACE_FREE.map(([r,g,b]) => `${r},${g},${b}`));
+        ov.visibleColorKeys = allColorKeys.filter(k => freeKeys.has(k));
+        await saveConfig(['overlays']);
+        clearOverlayCache();
+        await updateColorDistributionUI();
+    });
+
+    $('op-colors-paid').addEventListener('click', async () => {
+        const ov = getActiveOverlay();
+        if (!ov) return;
+        const counts = await getOverlayColorDistribution(ov);
+        const allColorKeys = Object.keys(counts);
+        const paidKeys = new Set(WPLACE_PAID.map(([r,g,b]) => `${r},${g},${b}`));
+        ov.visibleColorKeys = allColorKeys.filter(k => paidKeys.has(k));
         await saveConfig(['overlays']);
         clearOverlayCache();
         await updateColorDistributionUI();
