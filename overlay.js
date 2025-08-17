@@ -228,8 +228,20 @@
     const colorStrength = ov.opacity;
     const whiteStrength = 1 - colorStrength;
 
+    let visibleSet = null;
+    if (Array.isArray(ov.visibleColorKeys)) {
+        visibleSet = new Set(ov.visibleColorKeys);
+    }
+
     for (let i = 0; i < data.length; i += 4) {
       if (data[i + 3] > 0) {
+        if (visibleSet) {
+            const key = `${data[i]},${data[i+1]},${data[i+2]}`;
+            if (!visibleSet.has(key)) {
+                data[i+3] = 0;
+                continue;
+            }
+        }
         data[i]     = Math.round(data[i]     * colorStrength + 255 * whiteStrength);
         data[i + 1] = Math.round(data[i + 1] * colorStrength + 255 * whiteStrength);
         data[i + 2] = Math.round(data[i + 2] * colorStrength + 255 * whiteStrength);
@@ -291,6 +303,11 @@
     const center = Math.floor(scale / 2);
     const width = isect.w;
 
+    let visibleSet = null;
+    if (Array.isArray(ov.visibleColorKeys)) {
+        visibleSet = new Set(ov.visibleColorKeys);
+    }
+
     for (let i = 0; i < data.length; i += 4) {
       const a = data[i + 3];
       if (a === 0) continue;
@@ -301,6 +318,13 @@
       const absY = isect.y + py;
 
       if ((absX % scale) === center && (absY % scale) === center) {
+        if (visibleSet) {
+            const key = `${data[i]},${data[i+1]},${data[i+2]}`;
+            if (!visibleSet.has(key)) {
+                data[i+3] = 0;
+                continue;
+            }
+        }
         data[i]     = Math.round(data[i]     * colorStrength + 255 * whiteStrength);
         data[i + 1] = Math.round(data[i + 1] * colorStrength + 255 * whiteStrength);
         data[i + 2] = Math.round(data[i + 2] * colorStrength + 255 * whiteStrength);
@@ -512,6 +536,7 @@
     collapseList: false,
     collapseEditor: false,
     collapseNudge: false,
+    collapseColors: false,
 
     ccFreeKeys: DEFAULT_FREE_KEYS.slice(),
     ccPaidKeys: DEFAULT_PAID_KEYS.slice(),
@@ -675,6 +700,10 @@
       .op-color-list-count { font-weight: 600; }
       .op-color-list-item.premium .op-color-list-name { color: #eeff00ff; font-weight: bold; }
       .op-theme-dark .op-color-list-item.premium .op-color-list-name { color: #fdd835; }
+      
+      .op-dist-item { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 2px 4px; }
+      .op-dist-item.premium .op-color-list-name { color: #eeff00ff; font-weight: bold; }
+      .op-theme-dark .op-dist-item.premium .op-color-list-name { color: #fdd835; }
 
       /* Resize Modal */
       .op-rs-backdrop { position: fixed; inset: 0; z-index: 10000; background: rgba(0,0,0,0.45); display: none; }
@@ -845,6 +874,24 @@
             </div>
           </div>
         </div>
+
+        <div class="op-section" id="op-colors-section">
+          <div class="op-section-title">
+            <div class="op-title-left">
+              <span class="op-title-text">Color Distribution</span>
+            </div>
+            <div class="op-title-right">
+              <button class="op-chevron" id="op-collapse-colors" title="Collapse/Expand">▾</button>
+            </div>
+          </div>
+          <div id="op-colors-body">
+            <div class="op-row" style="gap: 6px;">
+              <button class="op-button" id="op-colors-all">All</button>
+              <button class="op-button" id="op-colors-none">None</button>
+            </div>
+            <div class="op-list" id="op-colors-list" style="max-height: 140px; gap: 4px;"></div>
+          </div>
+        </div>
       </div>
     `;
     document.body.appendChild(panel);
@@ -894,7 +941,7 @@
 
   async function addBlankOverlay() {
     const name = uniqueName('Overlay');
-    const ov = { id: uid(), name, enabled: true, imageUrl: null, imageBase64: null, isLocal: false, pixelUrl: null, offsetX: 0, offsetY: 0, opacity: 0.7 };
+    const ov = { id: uid(), name, enabled: true, imageUrl: null, imageBase64: null, isLocal: false, pixelUrl: null, offsetX: 0, offsetY: 0, opacity: 0.7, visibleColorKeys: null };
     config.overlays.push(ov);
     config.activeOverlayId = ov.id;
     await saveConfig(['overlays', 'activeOverlayId']);
@@ -935,7 +982,7 @@
       if (!imageUrl) { failed++; continue; }
       try {
         const base64 = await urlToDataURL(imageUrl);
-        const ov = { id: uid(), name, enabled: true, imageUrl, imageBase64: base64, isLocal: false, pixelUrl, offsetX, offsetY, opacity };
+        const ov = { id: uid(), name, enabled: true, imageUrl, imageBase64: base64, isLocal: false, pixelUrl, offsetX, offsetY, opacity, visibleColorKeys: null };
         config.overlays.push(ov); imported++;
       } catch (e) { console.error('Import failed for', imageUrl, e); failed++; }
     }
@@ -979,6 +1026,25 @@
     $('op-collapse-list').addEventListener('click', () => { config.collapseList = !config.collapseList; saveConfig(['collapseList']); updateUI(); });
     $('op-collapse-editor').addEventListener('click', () => { config.collapseEditor = !config.collapseEditor; saveConfig(['collapseEditor']); updateUI(); });
     $('op-collapse-nudge').addEventListener('click', () => { config.collapseNudge = !config.collapseNudge; saveConfig(['collapseNudge']); updateUI(); });
+    $('op-collapse-colors').addEventListener('click', () => { config.collapseColors = !config.collapseColors; saveConfig(['collapseColors']); updateUI(); });
+
+    $('op-colors-all').addEventListener('click', async () => {
+        const ov = getActiveOverlay();
+        if (!ov) return;
+        ov.visibleColorKeys = null;
+        await saveConfig(['overlays']);
+        clearOverlayCache();
+        await updateColorDistributionUI();
+    });
+
+    $('op-colors-none').addEventListener('click', async () => {
+        const ov = getActiveOverlay();
+        if (!ov) return;
+        ov.visibleColorKeys = [];
+        await saveConfig(['overlays']);
+        clearOverlayCache();
+        await updateColorDistributionUI();
+    });
 
     $('op-name').addEventListener('change', async (e) => {
       const ov = getActiveOverlay(); if (!ov) return;
@@ -1143,7 +1209,7 @@
     if (chevron) chevron.textContent = config.collapseEditor ? '▸' : '▾';
   }
 
-  function updateUI() {
+  async function updateUI() {
     const $ = (id) => document.getElementById(id);
     const panel = $('overlay-pro-panel');
     if (!panel) return;
@@ -1177,8 +1243,14 @@
     nudgeBody.style.display = config.collapseNudge ? 'none' : 'block';
     if (nudgeCz) nudgeCz.textContent = config.collapseNudge ? '▸' : '▾';
 
+    const colorsBody = $('op-colors-body');
+    const colorsCz = $('op-collapse-colors');
+    if (colorsBody) colorsBody.style.display = config.collapseColors ? 'none' : 'block';
+    if (colorsCz) colorsCz.textContent = config.collapseColors ? '▸' : '▾';
+
     rebuildOverlayListUI();
     updateEditorUI();
+    await updateColorDistributionUI();
 
     const exportBtn = $('op-export-overlay');
     const ov = getActiveOverlay();
@@ -1186,6 +1258,101 @@
     exportBtn.disabled = !canExport;
     exportBtn.title = canExport ? 'Export active overlay JSON' : 'Export disabled for local images';
   }
+
+  const colorDistributionCache = new Map();
+async function getOverlayColorDistribution(ov) {
+    if (!ov || !ov.imageBase64) return {};
+
+    const cacheKey = ov.imageBase64.slice(0, 64) + ':' + ov.imageBase64.length;
+    if (colorDistributionCache.has(cacheKey)) return colorDistributionCache.get(cacheKey);
+
+    const img = await loadImage(ov.imageBase64);
+    const canvas = createCanvas(img.width, img.height);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0);
+    const imageData = ctx.getImageData(0, 0, img.width, img.height);
+    const data = imageData.data;
+    const counts = {};
+    for (let i = 0; i < data.length; i += 4) {
+        if (data[i + 3] > 0) {
+            const key = `${data[i]},${data[i+1]},${data[i+2]}`;
+            counts[key] = (counts[key] || 0) + 1;
+        }
+    }
+    colorDistributionCache.set(cacheKey, counts);
+    return counts;
+}
+
+async function updateColorDistributionUI() {
+    const ov = getActiveOverlay();
+    const section = document.getElementById('op-colors-section');
+    if (!section) return;
+
+    if (!ov || !ov.imageBase64) {
+        section.style.display = 'none';
+        return;
+    }
+    section.style.display = 'flex';
+
+    const listEl = document.getElementById('op-colors-list');
+    listEl.innerHTML = `<div class="op-muted" style="text-align:center; padding: 12px 0;">Loading...</div>`;
+
+    const counts = await getOverlayColorDistribution(ov);
+
+    let visibleSet;
+    if (ov.visibleColorKeys === null || ov.visibleColorKeys === undefined) {
+        visibleSet = new Set(Object.keys(counts));
+    } else {
+        visibleSet = new Set(ov.visibleColorKeys);
+    }
+
+    const sorted = Object.entries(counts).sort(([,a],[,b]) => b - a);
+    const paidKeys = new Set(WPLACE_PAID.map(([r,g,b]) => `${r},${g},${b}`));
+
+    listEl.innerHTML = '';
+    if (sorted.length === 0) {
+        listEl.innerHTML = `<div class="op-muted" style="text-align:center; padding: 12px 0;">No colors found.</div>`;
+        return;
+    }
+
+    for (const [key, count] of sorted) {
+        const isPremium = paidKeys.has(key);
+        const name = WPLACE_NAMES[key] || key;
+        const item = document.createElement('div');
+        item.className = 'op-dist-item' + (isPremium ? ' premium' : '');
+        item.title = `${name} (${key}): ${count} pixels`;
+        item.innerHTML = `
+            <input type="checkbox" data-key="${key}" ${visibleSet.has(key) ? 'checked' : ''} style="margin-right: 4px;">
+            <div class="op-color-list-swatch" style="background-color: rgb(${key});"></div>
+            <div class="op-color-list-name">${name}</div>
+            <div class="op-color-list-count">${count}</div>
+        `;
+        listEl.appendChild(item);
+    }
+
+    listEl.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+        cb.addEventListener('change', async () => {
+            const key = cb.dataset.key;
+            const activeOv = getActiveOverlay();
+            if (!activeOv) return;
+            
+            if (activeOv.visibleColorKeys === null) {
+                const allKeys = Object.keys(await getOverlayColorDistribution(activeOv));
+                activeOv.visibleColorKeys = allKeys;
+            }
+
+            const currentVisibleSet = new Set(activeOv.visibleColorKeys);
+            if (cb.checked) {
+                currentVisibleSet.add(key);
+            } else {
+                currentVisibleSet.delete(key);
+            }
+            activeOv.visibleColorKeys = Array.from(currentVisibleSet);
+            await saveConfig(['overlays']);
+            clearOverlayCache();
+        });
+    });
+}
 
   let cc = null;
 
