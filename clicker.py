@@ -1,19 +1,20 @@
 """
-Color-Clicker / Grid-Finder  •  v4
-──────────────────────────────────
-• “Click” now steps every **N** pixels **relative to the first-pixel origin**
-  that “Check” discovered.  In other words, (first_x, first_y) is treated as
-  grid-coordinate (0,0); then we visit (first_x + k·N, first_y + m·N).
-• Keeps fast PyAutoGUI settings and ESC-to-abort.
+Color-Clicker / Smart Grid Detector • v6
+────────────────────────────────────────
+• Detects actual pixel squares/clusters
+• Clicks each cluster center once
+• No assumptions about grid alignment
 """
 
 import tkinter as tk
 from tkinter import ttk
 import threading
-from collections import Counter
 import pyautogui
 from pynput import mouse, keyboard
+import numpy as np
+from scipy.ndimage import label
 
+# ───── PyAutoGUI speed tweaks ─────
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0
 pyautogui.MINIMUM_DURATION = 0
@@ -21,52 +22,41 @@ pyautogui.MINIMUM_DURATION = 0
 class ColorClickerApp:
     def __init__(self, master: tk.Tk):
         self.master = master
-        master.title("Color Clicker")
-
-        self.colour_var      = tk.StringVar(value="255,0,255")
-        self.first_pixel_var = tk.StringVar(value="—")
-        self.n_var           = tk.StringVar(value="—")
-
-        ttk.Label(master, text="Target colour (R,G,B):") \
-            .grid(row=0, column=0, sticky="e", padx=6, pady=4)
-        ttk.Combobox(master, textvariable=self.colour_var,
-                     values=["255,0,255"], width=12, state="readonly") \
+        master.title("Color Clicker - Smart Grid")
+        
+        # ───── vars ─────
+        self.colour_var = tk.StringVar(value="255,0,255")
+        self.clusters_var = tk.StringVar(value="—")
+        
+        # ───── UI ─────
+        ttk.Label(master, text="Target colour (R,G,B):").grid(row=0, column=0, sticky="e", padx=6, pady=4)
+        ttk.Combobox(master, textvariable=self.colour_var, values=["255,0,255"], width=15, state="readonly")\
             .grid(row=0, column=1, padx=6, pady=4)
-
-        ttk.Label(master, text="First pixel (x,y):") \
-            .grid(row=1, column=0, sticky="e", padx=6, pady=4)
-        ttk.Entry(master, textvariable=self.first_pixel_var,
-                  width=12, state="readonly") \
+        
+        ttk.Label(master, text="Clusters found:").grid(row=1, column=0, sticky="e", padx=6, pady=4)
+        ttk.Entry(master, textvariable=self.clusters_var, width=15, state="readonly")\
             .grid(row=1, column=1, padx=6, pady=4)
-
-        ttk.Label(master, text="Grid size N:") \
-            .grid(row=2, column=0, sticky="e", padx=6, pady=4)
-        ttk.Combobox(master, textvariable=self.n_var,
-                     values=[str(i) for i in range(1, 65)],
-                     width=12, state="readonly") \
-            .grid(row=2, column=1, padx=6, pady=4)
-
-        ttk.Button(master, text="Eye Dropper",
-                   command=self.start_eyedropper) \
-            .grid(row=3, column=0, padx=6, pady=6)
-        ttk.Button(master, text="Check",
-                   command=self.start_checking) \
-            .grid(row=3, column=1, padx=6, pady=6)
-        ttk.Button(master, text="Click",
-                   command=self.start_scanning) \
-            .grid(row=3, column=2, padx=6, pady=6)
-
+        
+        ttk.Button(master, text="Eye Dropper", command=self.start_eyedropper)\
+            .grid(row=2, column=0, padx=6, pady=6)
+        ttk.Button(master, text="Analyze", command=self.analyze_grid)\
+            .grid(row=2, column=1, padx=6, pady=6)
+        ttk.Button(master, text="Click All", command=self.click_all)\
+            .grid(row=2, column=2, padx=6, pady=6)
+        
         self.status = tk.StringVar(value="Ready")
-        ttk.Label(master, textvariable=self.status) \
-            .grid(row=4, column=0, columnspan=3, pady=4)
-
+        ttk.Label(master, textvariable=self.status).grid(row=3, column=0, columnspan=3, pady=4)
+        
+        # Internal state
         self._stop_event = threading.Event()
-        self._kbd_listener: keyboard.Listener | None = None
-
+        self._kbd_listener = None
+        self.cluster_centers = []
+    
+    # ───────── Eye-dropper ─────────
     def start_eyedropper(self):
         self.status.set("Click anywhere to pick a colour…")
         self.master.withdraw()
-
+        
         def on_click(x, y, button, pressed):
             if pressed:
                 r, g, b = pyautogui.screenshot().getpixel((x, y))
@@ -74,102 +64,149 @@ class ColorClickerApp:
                 self.status.set(f"Picked {(r, g, b)}")
                 self.master.deiconify()
                 listener.stop()
-
+        
         listener = mouse.Listener(on_click=on_click)
         listener.start()
-
-    def _on_key_press(self, key):
-        if key == keyboard.Key.esc:
-            self._stop_event.set()
-
-    def start_scanning(self):
+    
+    # ───────── Analyze Grid ─────────
+    def analyze_grid(self):
+        self.status.set("Analyzing...")
+        threading.Thread(target=self._analyze_grid_thread, daemon=True).start()
+    
+    def _analyze_grid_thread(self):
         try:
             target = tuple(map(int, self.colour_var.get().split(",")))
-            assert len(target) == 3 and all(0 <= c <= 255 for c in target)
-        except Exception:
+        except:
             self.status.set("Invalid RGB value")
             return
-        try:
-            N = int(self.n_var.get())
-            assert 1 <= N <= 64
-        except Exception:
-            self.status.set("Grid size N not set (run Check first)")
+        
+        # Take screenshot and find target pixels
+        img = pyautogui.screenshot()
+        img_array = np.array(img)
+        
+        # Create binary mask of target color
+        mask = np.all(img_array[:, :, :3] == target, axis=2)
+        
+        # Find connected components (clusters of pixels)
+        labeled_array, num_clusters = label(mask)
+        
+        # Find center of each cluster
+        self.cluster_centers = []
+        for i in range(1, num_clusters + 1):
+            points = np.argwhere(labeled_array == i)
+            if len(points) > 0:
+                center_y, center_x = points.mean(axis=0).astype(int)
+                self.cluster_centers.append((center_x, center_y))
+        
+        self.clusters_var.set(str(len(self.cluster_centers)))
+        self.status.set(f"Found {len(self.cluster_centers)} clusters")
+    
+    # ───────── Click All Clusters ─────────
+    def click_all(self):
+        if not self.cluster_centers:
+            self.status.set("No clusters found. Run Analyze first.")
             return
-        try:
-            fx, fy = map(int, self.first_pixel_var.get().split(","))
-        except Exception:
-            self.status.set("First pixel not set (run Check first)")
-            return
-
+        
         self._stop_event.clear()
         self._kbd_listener = keyboard.Listener(on_press=self._on_key_press)
         self._kbd_listener.start()
-
-        self.status.set(f"Scanning every {N}px from ({fx},{fy})… (ESC to cancel)")
-        threading.Thread(target=self.scan_and_click,
-                         args=(target, N, fx, fy), daemon=True).start()
-
-    def scan_and_click(self, target_rgb: tuple[int, int, int],
-                       step: int, fx: int, fy: int):
-        img = pyautogui.screenshot()
-        w, h = img.size
-
-        for y in range(fy, h, step):
-            for x in range(fx, w, step):
-                if self._stop_event.is_set():
-                    self._finish_click("Cancelled")
-                    return
-                if img.getpixel((x, y))[:3] == target_rgb:
-                    pyautogui.click(x, y, _pause=False)
-
-        self._finish_click("Done")
-
+        
+        self.status.set(f"Clicking {len(self.cluster_centers)} clusters - ESC to cancel")
+        threading.Thread(target=self._click_thread, daemon=True).start()
+    
+    def _click_thread(self):
+        clicked = 0
+        for x, y in self.cluster_centers:
+            if self._stop_event.is_set():
+                self._finish_click(f"Cancelled after {clicked} clicks")
+                return
+            pyautogui.click(x, y, _pause=False)
+            clicked += 1
+        
+        self._finish_click(f"Clicked all {clicked} clusters")
+    
+    def _on_key_press(self, key):
+        if key == keyboard.Key.esc:
+            self._stop_event.set()
+    
     def _finish_click(self, msg: str):
         if self._kbd_listener:
             self._kbd_listener.stop()
             self._kbd_listener = None
         self.status.set(msg)
 
-    def start_checking(self):
-        self.status.set("Checking…")
-        threading.Thread(target=self.check_grid_size, daemon=True).start()
-
-    def check_grid_size(self):
+# ───────── Alternative: Simple deduplication approach ─────────
+class SimpleColorClicker:
+    """
+    Simpler approach without scipy - uses grid-based deduplication
+    """
+    def __init__(self, master: tk.Tk):
+        self.master = master
+        master.title("Color Clicker - Simple")
+        
+        # ───── vars ─────
+        self.colour_var = tk.StringVar(value="255,0,255")
+        self.grid_size_var = tk.StringVar(value="10")
+        
+        # ───── UI ─────
+        ttk.Label(master, text="Target colour (R,G,B):").grid(row=0, column=0, sticky="e", padx=6, pady=4)
+        ttk.Entry(master, textvariable=self.colour_var, width=15).grid(row=0, column=1, padx=6, pady=4)
+        
+        ttk.Label(master, text="Min pixel spacing:").grid(row=1, column=0, sticky="e", padx=6, pady=4)
+        ttk.Scale(master, from_=5, to=50, variable=self.grid_size_var, orient="horizontal")\
+            .grid(row=1, column=1, padx=6, pady=4)
+        
+        ttk.Button(master, text="Click All Pink", command=self.click_all).grid(row=2, column=0, columnspan=2, pady=10)
+        
+        self.status = tk.StringVar(value="Ready")
+        ttk.Label(master, textvariable=self.status).grid(row=3, column=0, columnspan=2, pady=4)
+    
+    def click_all(self):
+        threading.Thread(target=self._click_thread, daemon=True).start()
+    
+    def _click_thread(self):
+        try:
+            target = tuple(map(int, self.colour_var.get().split(",")))
+            spacing = int(float(self.grid_size_var.get()))
+        except:
+            self.status.set("Invalid input")
+            return
+        
+        self.status.set("Scanning and clicking...")
+        
         img = pyautogui.screenshot()
         w, h = img.size
-        target = tuple(map(int, self.colour_var.get().split(",")))
+        
+        clicked_zones = set()  # Track which grid zones we've clicked
+        click_count = 0
+        
+        # Scan entire screen
+        for y in range(h):
+            for x in range(w):
+                if img.getpixel((x, y))[:3] == target:
+                    # Calculate which grid zone this pixel belongs to
+                    zone_x = x // spacing
+                    zone_y = y // spacing
+                    zone = (zone_x, zone_y)
+                    
+                    # Click if we haven't clicked this zone yet
+                    if zone not in clicked_zones:
+                        pyautogui.click(x, y, _pause=False)
+                        clicked_zones.add(zone)
+                        click_count += 1
+        
+        self.status.set(f"Clicked {click_count} locations")
 
-        runs, first_coord = [], None
-        for y in range(0, h):
-            row = list(img.crop((0, y, w, y + 1)).getdata())
-            x = 0
-            while x < w and len(runs) < 3:
-                if row[x][:3] == target:
-                    if first_coord is None:
-                        first_coord = (x, y)
-                    run = 0
-                    while x < w and row[x][:3] == target:
-                        run += 1
-                        x += 1
-                    runs.append(run)
-                else:
-                    x += 1
-            if len(runs) == 3:
-                break
-
-        if not runs:
-            self.status.set("Target colour not found.")
-            return
-
-        counts = Counter(runs).most_common()
-        N = counts[0][0] if (len(counts) == 1 or counts[0][1] > 1) else sorted(runs)[1]
-
-        self.first_pixel_var.set(f"{first_coord[0]},{first_coord[1]}")
-        self.n_var.set(str(N))
-        self.status.set(f"Grid size N = {N} (runs: {runs})")
-
-
+# ───────── run ─────────
 if __name__ == "__main__":
     root = tk.Tk()
-    ColorClickerApp(root)
+    
+    # Try to import scipy for advanced clustering
+    try:
+        from scipy.ndimage import label
+        app = ColorClickerApp(root)
+    except ImportError:
+        print("scipy not found, using simple grid approach")
+        app = SimpleColorClicker(root)
+    
     root.mainloop()
