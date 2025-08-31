@@ -240,9 +240,13 @@
                 continue;
             }
         }
-        data[i]     = Math.round(data[i]     * colorStrength + 255 * whiteStrength);
-        data[i + 1] = Math.round(data[i + 1] * colorStrength + 255 * whiteStrength);
-        data[i + 2] = Math.round(data[i + 2] * colorStrength + 255 * whiteStrength);
+        if (config.highlightPixels) {
+          data[i] = 255; data[i+1] = 0; data[i+2] = 255;
+        } else {
+          data[i]     = Math.round(data[i]     * colorStrength + 255 * whiteStrength);
+          data[i + 1] = Math.round(data[i + 1] * colorStrength + 255 * whiteStrength);
+          data[i + 2] = Math.round(data[i + 2] * colorStrength + 255 * whiteStrength);
+        }
         data[i + 3] = 255;
       }
     }
@@ -323,9 +327,13 @@
                 continue;
             }
         }
-        data[i]     = Math.round(data[i]     * colorStrength + 255 * whiteStrength);
-        data[i + 1] = Math.round(data[i + 1] * colorStrength + 255 * whiteStrength);
-        data[i + 2] = Math.round(data[i + 2] * colorStrength + 255 * whiteStrength);
+        if (config.highlightPixels) {
+          data[i] = 255; data[i+1] = 0; data[i+2] = 255;
+        } else {
+          data[i]     = Math.round(data[i]     * colorStrength + 255 * whiteStrength);
+          data[i + 1] = Math.round(data[i + 1] * colorStrength + 255 * whiteStrength);
+          data[i + 2] = Math.round(data[i + 2] * colorStrength + 255 * whiteStrength);
+        }
         data[i + 3] = 255;
       } else {
         data[i] = 0; data[i + 1] = 0; data[i + 2] = 0; data[i + 3] = 0;
@@ -535,6 +543,7 @@
     collapseEditor: false,
     collapseNudge: false,
     collapseColors: false,
+    highlightPixels: false,
 
     ccFreeKeys: DEFAULT_FREE_KEYS.slice(),
     ccPaidKeys: DEFAULT_PAID_KEYS.slice(),
@@ -784,6 +793,10 @@
               <button class="op-button" id="op-autocap-toggle" title="Capture next clicked pixel as anchor">OFF</button>
             </div>
           </div>
+          <div class="op-row" style="padding: 4px 0;">
+            <input type="checkbox" id="op-highlight-toggle" style="margin-left: 4px;">
+            <label for="op-highlight-toggle" style="cursor:pointer;">Highlight pixels (pink)</label>
+          </div>
         </div>
 
         <div class="op-section">
@@ -1019,6 +1032,12 @@
       updateUI();
     });
     $('op-autocap-toggle').addEventListener('click', () => { config.autoCapturePixelUrl = !config.autoCapturePixelUrl; saveConfig(['autoCapturePixelUrl']); ensureHook(); updateUI(); });
+
+    $('op-highlight-toggle').addEventListener('change', async (e) => {
+      config.highlightPixels = e.target.checked;
+      await saveConfig(['highlightPixels']);
+      clearOverlayCache();
+    });
 
     $('op-add-overlay').addEventListener('click', async () => { try { await addBlankOverlay(); } catch (e) { console.error(e); } });
     $('op-import-overlay').addEventListener('click', async () => { const text = prompt('Paste overlay JSON (single or array):'); if (!text) return; await importOverlayFromJSON(text); });
@@ -1256,6 +1275,9 @@
     autoBtn.textContent = config.autoCapturePixelUrl ? 'ON' : 'OFF';
     autoBtn.classList.toggle('op-danger', !!config.autoCapturePixelUrl);
     placeLabel.classList.toggle('op-danger-text', !!config.autoCapturePixelUrl);
+
+    const highlightToggle = $('op-highlight-toggle');
+    if (highlightToggle) highlightToggle.checked = !!config.highlightPixels;
 
     const listWrap = $('op-list-wrap');
     const listCz = $('op-collapse-list');
