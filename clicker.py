@@ -1,15 +1,10 @@
 """
-Color-Clicker / Grid-Finder
-───────────────────────────
-• Eye Dropper – pick any pixel’s colour (fills the RGB box).
-• Click       – auto-click every 10th pixel in the lower half
-                that matches the target colour (ESC aborts).
-• Check       – finds the grid size **N** like so:
-      1. scans from mid-screen downward, left→right;
-      2. records the run-length of the first 3 stretches of
-         the **target colour** it meets;
-      3. the majority (mode) of those 3 lengths = N.
-                ↳ populates “First pixel” (x,y) and the N drop-down.
+Color-Clicker / Grid-Finder  •  v4
+──────────────────────────────────
+• “Click” now steps every **N** pixels **relative to the first-pixel origin**
+  that “Check” discovered.  In other words, (first_x, first_y) is treated as
+  grid-coordinate (0,0); then we visit (first_x + k·N, first_y + m·N).
+• Keeps fast PyAutoGUI settings and ESC-to-abort.
 """
 
 import tkinter as tk
@@ -20,7 +15,8 @@ import pyautogui
 from pynput import mouse, keyboard
 
 pyautogui.FAILSAFE = False
-
+pyautogui.PAUSE = 0
+pyautogui.MINIMUM_DURATION = 0
 
 class ColorClickerApp:
     def __init__(self, master: tk.Tk):
@@ -34,8 +30,7 @@ class ColorClickerApp:
         ttk.Label(master, text="Target colour (R,G,B):") \
             .grid(row=0, column=0, sticky="e", padx=6, pady=4)
         ttk.Combobox(master, textvariable=self.colour_var,
-                     values=["255,0,255"], width=12,
-                     state="readonly") \
+                     values=["255,0,255"], width=12, state="readonly") \
             .grid(row=0, column=1, padx=6, pady=4)
 
         ttk.Label(master, text="First pixel (x,y):") \
@@ -54,11 +49,11 @@ class ColorClickerApp:
         ttk.Button(master, text="Eye Dropper",
                    command=self.start_eyedropper) \
             .grid(row=3, column=0, padx=6, pady=6)
-        ttk.Button(master, text="Click",
-                   command=self.start_scanning) \
-            .grid(row=3, column=1, padx=6, pady=6)
         ttk.Button(master, text="Check",
                    command=self.start_checking) \
+            .grid(row=3, column=1, padx=6, pady=6)
+        ttk.Button(master, text="Click",
+                   command=self.start_scanning) \
             .grid(row=3, column=2, padx=6, pady=6)
 
         self.status = tk.StringVar(value="Ready")
@@ -91,29 +86,42 @@ class ColorClickerApp:
         try:
             target = tuple(map(int, self.colour_var.get().split(",")))
             assert len(target) == 3 and all(0 <= c <= 255 for c in target)
-        except (ValueError, AssertionError):
+        except Exception:
             self.status.set("Invalid RGB value")
+            return
+        try:
+            N = int(self.n_var.get())
+            assert 1 <= N <= 64
+        except Exception:
+            self.status.set("Grid size N not set (run Check first)")
+            return
+        try:
+            fx, fy = map(int, self.first_pixel_var.get().split(","))
+        except Exception:
+            self.status.set("First pixel not set (run Check first)")
             return
 
         self._stop_event.clear()
         self._kbd_listener = keyboard.Listener(on_press=self._on_key_press)
         self._kbd_listener.start()
 
-        self.status.set("Scanning… (hold ESC to cancel)")
+        self.status.set(f"Scanning every {N}px from ({fx},{fy})… (ESC to cancel)")
         threading.Thread(target=self.scan_and_click,
-                         args=(target,), daemon=True).start()
+                         args=(target, N, fx, fy), daemon=True).start()
 
-    def scan_and_click(self, target_rgb: tuple[int, int, int]):
+    def scan_and_click(self, target_rgb: tuple[int, int, int],
+                       step: int, fx: int, fy: int):
         img = pyautogui.screenshot()
         w, h = img.size
 
-        for y in range(h // 2, h, 10):
-            for x in range(0, w, 10):
+        for y in range(fy, h, step):
+            for x in range(fx, w, step):
                 if self._stop_event.is_set():
                     self._finish_click("Cancelled")
                     return
                 if img.getpixel((x, y))[:3] == target_rgb:
-                    pyautogui.click(x, y)
+                    pyautogui.click(x, y, _pause=False)
+
         self._finish_click("Done")
 
     def _finish_click(self, msg: str):
@@ -131,10 +139,8 @@ class ColorClickerApp:
         w, h = img.size
         target = tuple(map(int, self.colour_var.get().split(",")))
 
-        runs = []
-        first_coord = None
-
-        for y in range(h // 2, h):
+        runs, first_coord = [], None
+        for y in range(0, h):
             row = list(img.crop((0, y, w, y + 1)).getdata())
             x = 0
             while x < w and len(runs) < 3:
@@ -156,10 +162,7 @@ class ColorClickerApp:
             return
 
         counts = Counter(runs).most_common()
-        if len(counts) == 1 or counts[0][1] > 1:
-            N = counts[0][0]
-        else:
-            N = sorted(runs)[1]
+        N = counts[0][0] if (len(counts) == 1 or counts[0][1] > 1) else sorted(runs)[1]
 
         self.first_pixel_var.set(f"{first_coord[0]},{first_coord[1]}")
         self.n_var.set(str(N))
