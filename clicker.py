@@ -1,212 +1,447 @@
 """
-Color-Clicker / Smart Grid Detector • v6
-────────────────────────────────────────
-• Detects actual pixel squares/clusters
-• Clicks each cluster center once
-• No assumptions about grid alignment
+Adaptive Color Clicker • v11
+────────────────────────────
+- No fixed grid stride; works with variable square sizes
+- Finds connected pink regions and splits fused blocks adaptively
+- Clicks safe interior points (distance-transform maxima)
+- Color tolerance, preview, ESC to cancel, pre-click verification
 """
 
+import sys, ctypes, threading, time
 import tkinter as tk
-from tkinter import ttk
-import threading
-import pyautogui
-from pynput import mouse, keyboard
+from tkinter import ttk, messagebox
+from PIL import Image, ImageDraw, ImageTk
 import numpy as np
-from scipy.ndimage import label
+import pyautogui
+from pynput import keyboard, mouse
 
-# ───── PyAutoGUI speed tweaks ─────
+# Optional but strongly recommended
+try:
+    import scipy.ndimage as ndi
+    SCIPY_OK = True
+except Exception:
+    SCIPY_OK = False
+
+# PyAutoGUI speed tweaks
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0
 pyautogui.MINIMUM_DURATION = 0
 
-class ColorClickerApp:
+def enable_dpi_awareness():
+    if sys.platform.startswith("win"):
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # per-monitor DPI
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+enable_dpi_awareness()
+
+def parse_rgb(s: str) -> tuple[int, int, int]:
+    vals = tuple(int(x.strip()) for x in s.split(","))
+    if len(vals) != 3 or any(not (0 <= v <= 255) for v in vals):
+        raise ValueError("Invalid RGB")
+    return vals
+
+def build_mask(img_array: np.ndarray, rgb: tuple[int,int,int], tol: int) -> np.ndarray:
+    # L1 color distance tolerance
+    tgt = np.array(rgb, dtype=np.int16)
+    diff = np.abs(img_array[:, :, :3].astype(np.int16) - tgt)
+    dist = np.sum(diff, axis=2)
+    return dist <= (tol * 3)
+
+def pre_click_matches(x: int, y: int, rgb: tuple[int,int,int], tol: int) -> bool:
+    try:
+        r, g, b = pyautogui.pixel(x, y)
+    except Exception:
+        return False
+    return (abs(r - rgb[0]) + abs(g - rgb[1]) + abs(b - rgb[2])) <= (tol * 3)
+
+class AdaptiveColorClicker:
     def __init__(self, master: tk.Tk):
         self.master = master
-        master.title("Color Clicker - Smart Grid")
-        
-        # ───── vars ─────
-        self.colour_var = tk.StringVar(value="255,0,255")
-        self.clusters_var = tk.StringVar(value="—")
-        
-        # ───── UI ─────
-        ttk.Label(master, text="Target colour (R,G,B):").grid(row=0, column=0, sticky="e", padx=6, pady=4)
-        ttk.Combobox(master, textvariable=self.colour_var, values=["255,0,255"], width=15, state="readonly")\
-            .grid(row=0, column=1, padx=6, pady=4)
-        
-        ttk.Label(master, text="Clusters found:").grid(row=1, column=0, sticky="e", padx=6, pady=4)
-        ttk.Entry(master, textvariable=self.clusters_var, width=15, state="readonly")\
-            .grid(row=1, column=1, padx=6, pady=4)
-        
-        ttk.Button(master, text="Eye Dropper", command=self.start_eyedropper)\
-            .grid(row=2, column=0, padx=6, pady=6)
-        ttk.Button(master, text="Analyze", command=self.analyze_grid)\
-            .grid(row=2, column=1, padx=6, pady=6)
-        ttk.Button(master, text="Click All", command=self.click_all)\
-            .grid(row=2, column=2, padx=6, pady=6)
-        
+        master.title("Adaptive Color Clicker")
+        master.geometry("520x640")
+
+        # Config frame
+        cfg = ttk.LabelFrame(master, text="Configuration", padding=10)
+        cfg.pack(fill="x", padx=10, pady=8)
+
+        ttk.Label(cfg, text="Target RGB:").grid(row=0, column=0, sticky="e", padx=5, pady=4)
+        self.rgb_var = tk.StringVar(value="255,0,255")
+        ttk.Entry(cfg, textvariable=self.rgb_var, width=12).grid(row=0, column=1, padx=5, pady=4)
+        ttk.Button(cfg, text="Pick", command=self.eyedropper, width=8).grid(row=0, column=2, padx=5, pady=4)
+
+        ttk.Label(cfg, text="Tolerance:").grid(row=1, column=0, sticky="e", padx=5, pady=4)
+        self.tol_var = tk.IntVar(value=6)
+        ttk.Scale(cfg, from_=0, to=40, variable=self.tol_var, orient="horizontal", length=140)\
+            .grid(row=1, column=1, padx=5, pady=4)
+        ttk.Label(cfg, textvariable=self.tol_var, width=3).grid(row=1, column=2, sticky="w")
+
+        ttk.Label(cfg, text="Min blob area (px):").grid(row=2, column=0, sticky="e", padx=5, pady=4)
+        self.min_area_var = tk.IntVar(value=8)
+        ttk.Scale(cfg, from_=1, to=500, variable=self.min_area_var, orient="horizontal", length=140)\
+            .grid(row=2, column=1, padx=5, pady=4)
+        ttk.Label(cfg, textvariable=self.min_area_var, width=4).grid(row=2, column=2, sticky="w")
+
+        ttk.Label(cfg, text="Safety inset (%):").grid(row=3, column=0, sticky="e", padx=5, pady=4)
+        self.inset_pct_var = tk.IntVar(value=25)  # how far from borders we prefer
+        ttk.Scale(cfg, from_=0, to=45, variable=self.inset_pct_var, orient="horizontal", length=140)\
+            .grid(row=3, column=1, padx=5, pady=4)
+        ttk.Label(cfg, textvariable=self.inset_pct_var, width=3).grid(row=3, column=2, sticky="w")
+
+        self.split_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(cfg, text="Split fused blocks adaptively", variable=self.split_var)\
+            .grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=(2,6))
+
+        self.verify_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(cfg, text="Verify color before each click", variable=self.verify_var)\
+            .grid(row=5, column=0, columnspan=3, sticky="w", padx=5)
+
+        # Actions
+        actions = ttk.LabelFrame(master, text="Actions", padding=10)
+        actions.pack(fill="x", padx=10, pady=8)
+        ttk.Button(actions, text="🔍 Analyze", width=14, command=self.analyze).pack(side="left", padx=4)
+        ttk.Button(actions, text="👁️ Preview", width=14, command=self.preview).pack(side="left", padx=4)
+        ttk.Button(actions, text="🎯 Click All", width=14, command=self.click_all).pack(side="left", padx=4)
+
+        # Stats / info
+        stats = ttk.LabelFrame(master, text="Info", padding=8)
+        stats.pack(fill="both", expand=True, padx=10, pady=8)
+        self.info_text = tk.Text(stats, height=10, wrap="word")
+        self.info_text.pack(fill="both", expand=True)
+
+        # Status
         self.status = tk.StringVar(value="Ready")
-        ttk.Label(master, textvariable=self.status).grid(row=3, column=0, columnspan=3, pady=4)
-        
+        ttk.Label(master, textvariable=self.status, relief="sunken", padding=6)\
+           .pack(fill="x", padx=10, pady=(0,10))
+
         # Internal state
-        self._stop_event = threading.Event()
-        self._kbd_listener = None
-        self.cluster_centers = []
-    
-    # ───────── Eye-dropper ─────────
-    def start_eyedropper(self):
-        self.status.set("Click anywhere to pick a colour…")
+        self._stop = threading.Event()
+        self.targets: list[tuple[int,int]] = []
+        self.last_img = None
+        self.last_mask = None
+        self.typical_size = None  # learned from data
+
+        if not SCIPY_OK:
+            self._append_info("Note: SciPy not found. Please `pip install scipy` for best accuracy.")
+
+    # Eyedropper
+    def eyedropper(self):
         self.master.withdraw()
-        
+        self.status.set("Click anywhere on screen to pick color...")
+
         def on_click(x, y, button, pressed):
             if pressed:
-                r, g, b = pyautogui.screenshot().getpixel((x, y))
-                self.colour_var.set(f"{r},{g},{b}")
-                self.status.set(f"Picked {(r, g, b)}")
+                img = pyautogui.screenshot()
+                r, g, b = img.getpixel((x, y))
+                self.rgb_var.set(f"{r},{g},{b}")
                 self.master.deiconify()
+                self.status.set(f"Picked RGB({r},{g},{b})")
                 listener.stop()
-        
+
         listener = mouse.Listener(on_click=on_click)
         listener.start()
-    
-    # ───────── Analyze Grid ─────────
-    def analyze_grid(self):
+
+    # Analyze
+    def analyze(self):
+        if not SCIPY_OK:
+            if not messagebox.askokcancel(
+                "SciPy required",
+                "This mode needs SciPy (scipy.ndimage) for reliable segmentation.\n\n"
+                "Continue anyway? It may be slow or inaccurate."
+            ):
+                return
         self.status.set("Analyzing...")
-        threading.Thread(target=self._analyze_grid_thread, daemon=True).start()
-    
-    def _analyze_grid_thread(self):
+        threading.Thread(target=self._analyze_thread, daemon=True).start()
+
+    def _analyze_thread(self):
         try:
-            target = tuple(map(int, self.colour_var.get().split(",")))
-        except:
+            target_rgb = parse_rgb(self.rgb_var.get())
+        except Exception:
             self.status.set("Invalid RGB value")
             return
-        
-        # Take screenshot and find target pixels
+
+        tol = int(self.tol_var.get())
+        min_area = int(self.min_area_var.get())
+        inset_pct = int(self.inset_pct_var.get())
+        split_blocks = self.split_var.get()
+
+        # Take screenshot and mask
         img = pyautogui.screenshot()
-        img_array = np.array(img)
-        
-        # Create binary mask of target color
-        mask = np.all(img_array[:, :, :3] == target, axis=2)
-        
-        # Find connected components (clusters of pixels)
-        labeled_array, num_clusters = label(mask)
-        
-        # Find center of each cluster
-        self.cluster_centers = []
-        for i in range(1, num_clusters + 1):
-            points = np.argwhere(labeled_array == i)
-            if len(points) > 0:
-                center_y, center_x = points.mean(axis=0).astype(int)
-                self.cluster_centers.append((center_x, center_y))
-        
-        self.clusters_var.set(str(len(self.cluster_centers)))
-        self.status.set(f"Found {len(self.cluster_centers)} clusters")
-    
-    # ───────── Click All Clusters ─────────
-    def click_all(self):
-        if not self.cluster_centers:
-            self.status.set("No clusters found. Run Analyze first.")
+        arr = np.array(img)
+        mask = build_mask(arr, target_rgb, tol)
+
+        self.last_img = img
+        self.last_mask = mask
+
+        total_on = int(np.sum(mask))
+        if total_on == 0:
+            self.targets = []
+            self._append_info("No target pixels found with current tolerance.")
+            self.status.set("No targets")
             return
-        
-        self._stop_event.clear()
-        self._kbd_listener = keyboard.Listener(on_press=self._on_key_press)
-        self._kbd_listener.start()
-        
-        self.status.set(f"Clicking {len(self.cluster_centers)} clusters - ESC to cancel")
-        threading.Thread(target=self._click_thread, daemon=True).start()
-    
-    def _click_thread(self):
+
+        if not SCIPY_OK:
+            # Weak fallback: sample points on mask spaced by ~typical spacing
+            self.targets = self._fallback_greedy_targets(mask)
+            self._summarize(total_on, len(self.targets), learned_size=None, fused_splits=False)
+            self.status.set(f"Found {len(self.targets)} targets (fallback)")
+            return
+
+        # Label connected components (4-connectivity to avoid diagonal merges)
+        structure = np.array([[0,1,0],
+                              [1,1,1],
+                              [0,1,0]], dtype=bool)
+        labeled, num = ndi.label(mask, structure=structure)
+        obj_slices = ndi.find_objects(labeled)
+
+        regions = []
+        sizes_for_learning = []
+
+        # compute distance transform once
+        dist = ndi.distance_transform_edt(mask)
+
+        for i in range(1, num + 1):
+            slc = obj_slices[i - 1]
+            if slc is None:
+                continue
+            y0, y1 = slc[0].start, slc[0].stop
+            x0, x1 = slc[1].start, slc[1].stop
+
+            comp_mask = (labeled[y0:y1, x0:x1] == i)
+            area = int(np.sum(comp_mask))
+            if area < min_area:
+                continue
+
+            h = y1 - y0
+            w = x1 - x0
+            regions.append((x0, y0, w, h, area))
+            sizes_for_learning.append(min(w, h))
+
+        if not regions:
+            self.targets = []
+            self._append_info("No regions passed the min-area filter.")
+            self.status.set("No targets")
+            return
+
+        # Learn a typical square size from the distribution (robust median of central band)
+        sizes = np.array(sizes_for_learning, dtype=np.float32)
+        if len(sizes) >= 5:
+            lo, hi = np.percentile(sizes, [20, 80])
+            central_band = sizes[(sizes >= lo) & (sizes <= hi)]
+            typical = float(np.median(central_band)) if len(central_band) > 0 else float(np.median(sizes))
+        else:
+            typical = float(np.median(sizes))
+        typical = max(2.0, min(128.0, typical))
+        self.typical_size = typical
+
+        # Build click targets
+        targets = []
+        fused_splits = 0
+
+        for (x0, y0, w, h, area) in regions:
+            if split_blocks and (w > typical * 1.4 or h > typical * 1.4):
+                # Likely a fused block; adaptively split along each axis by learned size
+                nx = max(1, int(round(w / typical)))
+                ny = max(1, int(round(h / typical)))
+
+                # Avoid crazy oversplits on noisy shapes
+                if w <= typical * 1.4: nx = 1
+                if h <= typical * 1.4: ny = 1
+
+                # Create a local grid inside the region
+                for gy in range(ny):
+                    for gx in range(nx):
+                        sub_x0 = int(x0 + (gx    ) * w / nx)
+                        sub_x1 = int(x0 + (gx + 1) * w / nx)
+                        sub_y0 = int(y0 + (gy    ) * h / ny)
+                        sub_y1 = int(y0 + (gy + 1) * h / ny)
+                        if sub_x1 <= sub_x0 or sub_y1 <= sub_y0:
+                            continue
+                        cx, cy = self._pick_center_via_distance(dist, mask, sub_x0, sub_y0, sub_x1, sub_y1)
+                        if cx is not None:
+                            targets.append((cx, cy))
+                if nx * ny > 1:
+                    fused_splits += (nx * ny - 1)
+            else:
+                # Single region → center via distance transform inside the bbox
+                cx, cy = self._pick_center_via_distance(dist, mask, x0, y0, x0 + w, y0 + h)
+                if cx is not None:
+                    targets.append((cx, cy))
+
+        # Safety inset pass: nudge points further inside (optional)
+        inset_ratio = float(inset_pct) / 100.0
+        if inset_ratio > 0 and SCIPY_OK:
+            # We can apply a small erosion to get safer centers by recomputing within tighter windows.
+            safe_targets = []
+            for (x, y) in targets:
+                # Use a local square window based on learned typical size
+                win = int(max(4, self.typical_size))
+                x0 = max(0, x - win // 2)
+                y0 = max(0, y - win // 2)
+                x1 = min(mask.shape[1], x + win // 2 + 1)
+                y1 = min(mask.shape[0], y + win // 2 + 1)
+                cx, cy = self._pick_center_via_distance(dist, mask, x0, y0, x1, y1)
+                safe_targets.append((cx if cx is not None else x, cy if cy is not None else y))
+            targets = safe_targets
+
+        # Deduplicate targets that land too close (due to subdivision overlap)
+        targets = self._dedupe_targets(targets, spacing=max(2, int(round(self.typical_size * 0.4))))
+
+        # Sort row-major (top to bottom, left to right)
+        targets.sort(key=lambda p: (p[1], p[0]))
+        self.targets = targets
+
+        self._summarize(total_on, len(self.targets), learned_size=self.typical_size, fused_splits=fused_splits)
+        self.status.set(f"Found {len(self.targets)} targets")
+
+    def _pick_center_via_distance(self, dist, mask, x0, y0, x1, y1):
+        sub = dist[y0:y1, x0:x1]
+        if sub.size == 0:
+            return (None, None)
+        # Pick the pixel farthest from background (largest EDT value)
+        idx = np.argmax(sub)
+        dy, dx = np.unravel_index(idx, sub.shape)
+        if sub[dy, dx] <= 0:
+            # No target pixels in this window
+            return (None, None)
+        return (x0 + int(dx), y0 + int(dy))
+
+    def _dedupe_targets(self, points, spacing: int):
+        if not points:
+            return []
+        spacing = max(1, spacing)
+        cell = spacing
+        seen = set()
+        deduped = []
+        for x, y in points:
+            key = (x // cell, y // cell)
+            if key not in seen:
+                seen.add(key)
+                deduped.append((x, y))
+        return deduped
+
+    def _fallback_greedy_targets(self, mask: np.ndarray):
+        # Very simple greedy dedup scan if SciPy is missing
+        h, w = mask.shape
+        targets = []
+        visited = np.zeros_like(mask, dtype=bool)
+        # estimate spacing from density
+        on = np.sum(mask)
+        approx = max(8, int(round(np.sqrt((w * h) / max(on, 1)))))
+        step = approx
+
+        for y in range(0, h, step):
+            for x in range(0, w, step):
+                sub = mask[y:min(y+step, h), x:min(x+step, w)]
+                if np.any(sub):
+                    yy, xx = np.argwhere(sub)[0]
+                    X = x + int(xx); Y = y + int(yy)
+                    if not visited[Y, X]:
+                        targets.append((X, Y))
+                        y0 = max(0, Y - step//2); y1 = min(h, Y + step//2 + 1)
+                        x0 = max(0, X - step//2); x1 = min(w, X + step//2 + 1)
+                        visited[y0:y1, x0:x1] = True
+        return targets
+
+    def _summarize(self, total_pixels_on, target_count, learned_size=None, fused_splits=0):
+        lines = []
+        lines.append(f"Total target pixels: {total_pixels_on:,}")
+        lines.append(f"Click targets: {target_count}")
+        if learned_size:
+            lines.append(f"Learned typical size: {learned_size:.1f}px")
+        if self.split_var.get():
+            lines.append(f"Fused-split additions: {fused_splits}")
+        self._set_info("\n".join(lines))
+
+    # Preview
+    def preview(self):
+        if not self.targets:
+            self.status.set("No targets to preview (run Analyze).")
+            return
+        if self.last_img is None:
+            self.status.set("No screenshot available.")
+            return
+
+        img = self.last_img.copy()
+        draw = ImageDraw.Draw(img)
+
+        # Draw each target as a red cross + dot
+        for (x, y) in self.targets:
+            draw.line((x-6, y, x+6, y), fill="red", width=2)
+            draw.line((x, y-6, x, y+6), fill="red", width=2)
+            draw.ellipse((x-2, y-2, x+2, y+2), fill="yellow", outline="black")
+
+        # Show preview
+        win = tk.Toplevel(self.master)
+        win.title(f"Preview ({len(self.targets)} targets)")
+        show = img.copy()
+        show.thumbnail((1000, 800), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(show)
+        lbl = ttk.Label(win, image=photo)
+        lbl.image = photo
+        lbl.pack(padx=8, pady=8)
+
+    # Click
+    def click_all(self):
+        if not self.targets:
+            self.status.set("No targets to click. Run Analyze first.")
+            return
+        self._stop.clear()
+        self.status.set(f"Clicking {len(self.targets)} targets... (ESC to stop)")
+
+        def on_press(key):
+            if key == keyboard.Key.esc:
+                self._stop.set()
+        listener = keyboard.Listener(on_press=on_press)
+        listener.start()
+        threading.Thread(target=self._click_thread, args=(listener,), daemon=True).start()
+
+    def _click_thread(self, listener):
+        try:
+            rgb = parse_rgb(self.rgb_var.get())
+        except Exception:
+            self.status.set("Invalid RGB")
+            try:
+                listener.stop()
+            except Exception:
+                pass
+            return
+
+        tol = int(self.tol_var.get())
+        verify = self.verify_var.get()
         clicked = 0
-        for x, y in self.cluster_centers:
-            if self._stop_event.is_set():
-                self._finish_click(f"Cancelled after {clicked} clicks")
-                return
+        total = len(self.targets)
+
+        for (x, y) in self.targets:
+            if self._stop.is_set():
+                break
+            if verify and not pre_click_matches(x, y, rgb, tol):
+                # Skip if pixel drifted or window changed
+                continue
             pyautogui.click(x, y, _pause=False)
             clicked += 1
-        
-        self._finish_click(f"Clicked all {clicked} clusters")
-    
-    def _on_key_press(self, key):
-        if key == keyboard.Key.esc:
-            self._stop_event.set()
-    
-    def _finish_click(self, msg: str):
-        if self._kbd_listener:
-            self._kbd_listener.stop()
-            self._kbd_listener = None
-        self.status.set(msg)
 
-# ───────── Alternative: Simple deduplication approach ─────────
-class SimpleColorClicker:
-    """
-    Simpler approach without scipy - uses grid-based deduplication
-    """
-    def __init__(self, master: tk.Tk):
-        self.master = master
-        master.title("Color Clicker - Simple")
-        
-        # ───── vars ─────
-        self.colour_var = tk.StringVar(value="255,0,255")
-        self.grid_size_var = tk.StringVar(value="10")
-        
-        # ───── UI ─────
-        ttk.Label(master, text="Target colour (R,G,B):").grid(row=0, column=0, sticky="e", padx=6, pady=4)
-        ttk.Entry(master, textvariable=self.colour_var, width=15).grid(row=0, column=1, padx=6, pady=4)
-        
-        ttk.Label(master, text="Min pixel spacing:").grid(row=1, column=0, sticky="e", padx=6, pady=4)
-        ttk.Scale(master, from_=5, to=50, variable=self.grid_size_var, orient="horizontal")\
-            .grid(row=1, column=1, padx=6, pady=4)
-        
-        ttk.Button(master, text="Click All Pink", command=self.click_all).grid(row=2, column=0, columnspan=2, pady=10)
-        
-        self.status = tk.StringVar(value="Ready")
-        ttk.Label(master, textvariable=self.status).grid(row=3, column=0, columnspan=2, pady=4)
-    
-    def click_all(self):
-        threading.Thread(target=self._click_thread, daemon=True).start()
-    
-    def _click_thread(self):
         try:
-            target = tuple(map(int, self.colour_var.get().split(",")))
-            spacing = int(float(self.grid_size_var.get()))
-        except:
-            self.status.set("Invalid input")
-            return
-        
-        self.status.set("Scanning and clicking...")
-        
-        img = pyautogui.screenshot()
-        w, h = img.size
-        
-        clicked_zones = set()  # Track which grid zones we've clicked
-        click_count = 0
-        
-        # Scan entire screen
-        for y in range(h):
-            for x in range(w):
-                if img.getpixel((x, y))[:3] == target:
-                    # Calculate which grid zone this pixel belongs to
-                    zone_x = x // spacing
-                    zone_y = y // spacing
-                    zone = (zone_x, zone_y)
-                    
-                    # Click if we haven't clicked this zone yet
-                    if zone not in clicked_zones:
-                        pyautogui.click(x, y, _pause=False)
-                        clicked_zones.add(zone)
-                        click_count += 1
-        
-        self.status.set(f"Clicked {click_count} locations")
+            listener.stop()
+        except Exception:
+            pass
+        self.status.set(f"Clicked {clicked}/{total}")
 
-# ───────── run ─────────
+    # UI helpers
+    def _append_info(self, msg: str):
+        self.info_text.insert(tk.END, msg + "\n")
+        self.info_text.see(tk.END)
+
+    def _set_info(self, msg: str):
+        self.info_text.delete("1.0", tk.END)
+        self.info_text.insert("1.0", msg)
+
+# Run
 if __name__ == "__main__":
     root = tk.Tk()
-    
-    # Try to import scipy for advanced clustering
-    try:
-        from scipy.ndimage import label
-        app = ColorClickerApp(root)
-    except ImportError:
-        print("scipy not found, using simple grid approach")
-        app = SimpleColorClicker(root)
-    
+    app = AdaptiveColorClicker(root)
     root.mainloop()
