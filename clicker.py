@@ -8,7 +8,9 @@ Adaptive Color Clicker • v12
 - NEW: Auto-hide the UI during Analyze/Click with configurable delay
 """
 
-import sys, ctypes, threading, time
+import sys
+import ctypes
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 from PIL import Image, ImageDraw, ImageTk
@@ -93,23 +95,29 @@ class AdaptiveColorClicker:
             .grid(row=3, column=1, padx=5, pady=4)
         ttk.Label(cfg, textvariable=self.inset_pct_var, width=3).grid(row=3, column=2, sticky="w")
 
+        ttk.Label(cfg, text="Max clicks:").grid(row=4, column=0, sticky="e", padx=5, pady=4)
+        self.max_pixels_var = tk.IntVar(value=9999)
+        self.max_pixels_slider = ttk.Scale(cfg, from_=1, to=9999, variable=self.max_pixels_var, orient="horizontal", length=160)
+        self.max_pixels_slider.grid(row=4, column=1, padx=5, pady=4)
+        ttk.Label(cfg, textvariable=self.max_pixels_var, width=5).grid(row=4, column=2, sticky="w")
+
         self.split_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(cfg, text="Split fused blocks adaptively", variable=self.split_var)\
-            .grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=(2,6))
+            .grid(row=5, column=0, columnspan=3, sticky="w", padx=5, pady=(2,6))
 
         self.verify_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(cfg, text="Verify color before each click", variable=self.verify_var)\
-            .grid(row=5, column=0, columnspan=3, sticky="w", padx=5)
+            .grid(row=6, column=0, columnspan=3, sticky="w", padx=5)
 
         # New: auto-hide options
         self.autohide_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(cfg, text="Hide window during Analyze/Click", variable=self.autohide_var)\
-            .grid(row=6, column=0, columnspan=3, sticky="w", padx=5, pady=(8,2))
+            .grid(row=7, column=0, columnspan=3, sticky="w", padx=5, pady=(8,2))
 
-        ttk.Label(cfg, text="Hide delay (ms):").grid(row=7, column=0, sticky="e", padx=5, pady=4)
+        ttk.Label(cfg, text="Hide delay (ms):").grid(row=8, column=0, sticky="e", padx=5, pady=4)
         self.hide_delay_var = tk.IntVar(value=180)
         ttk.Spinbox(cfg, from_=0, to=1000, increment=20, textvariable=self.hide_delay_var, width=6)\
-            .grid(row=7, column=1, sticky="w", padx=5, pady=4)
+            .grid(row=8, column=1, sticky="w", padx=5, pady=4)
 
         # Actions
         actions = ttk.LabelFrame(master, text="Actions", padding=10)
@@ -221,7 +229,7 @@ class AdaptiveColorClicker:
 
             total_on = int(np.sum(mask))
             if total_on == 0:
-                self.targets = []
+                self._set_targets([])
                 self._append_info("No target pixels found with current tolerance.")
                 self.status.set("No targets")
                 return
@@ -264,7 +272,7 @@ class AdaptiveColorClicker:
                 sizes_for_learning.append(min(w, h))
 
             if not regions:
-                self.targets = []
+                self._set_targets([])
                 self._append_info("No regions passed the min-area filter.")
                 self.status.set("No targets")
                 return
@@ -289,8 +297,10 @@ class AdaptiveColorClicker:
                     # Likely a fused block; adaptively split
                     nx = max(1, int(round(w / typical)))
                     ny = max(1, int(round(h / typical)))
-                    if w <= typical * 1.4: nx = 1
-                    if h <= typical * 1.4: ny = 1
+                    if w <= typical * 1.4:
+                        nx = 1
+                    if h <= typical * 1.4:
+                        ny = 1
 
                     for gy in range(ny):
                         for gx in range(nx):
@@ -329,7 +339,7 @@ class AdaptiveColorClicker:
 
             # Sort row-major
             targets.sort(key=lambda p: (p[1], p[0]))
-            self.targets = targets
+            self._set_targets(targets)
 
             self._summarize(total_on, len(self.targets), learned_size=self.typical_size, fused_splits=fused_splits)
             self.status.set(f"Found {len(self.targets)} targets")
@@ -373,11 +383,14 @@ class AdaptiveColorClicker:
                 sub = mask[y:min(y+step, h), x:min(x+step, w)]
                 if np.any(sub):
                     yy, xx = np.argwhere(sub)[0]
-                    X = x + int(xx); Y = y + int(yy)
+                    X = x + int(xx)
+                    Y = y + int(yy)
                     if not visited[Y, X]:
                         targets.append((X, Y))
-                        y0 = max(0, Y - step//2); y1 = min(h, Y + step//2 + 1)
-                        x0 = max(0, X - step//2); x1 = min(w, X + step//2 + 1)
+                        y0 = max(0, Y - step//2)
+                        y1 = min(h, Y + step//2 + 1)
+                        x0 = max(0, X - step//2)
+                        x1 = min(w, X + step//2 + 1)
                         visited[y0:y1, x0:x1] = True
         return targets
 
@@ -390,6 +403,19 @@ class AdaptiveColorClicker:
         if self.split_var.get():
             lines.append(f"Fused-split additions: {fused_splits}")
         self._set_info("\n".join(lines))
+
+    def _set_targets(self, targets):
+        self.targets = targets
+        def update_slider():
+            num_targets = len(self.targets)
+            if num_targets > 0:
+                self.max_pixels_slider.config(to=num_targets)
+                self.max_pixels_var.set(num_targets)
+            else:
+                self.max_pixels_slider.config(to=1) # from is 1
+                self.max_pixels_var.set(1)
+        if hasattr(self, 'max_pixels_slider'): # check if UI is built
+            self.master.after(0, update_slider)
 
     # Preview
     def preview(self):
@@ -455,10 +481,12 @@ class AdaptiveColorClicker:
         tol = int(self.tol_var.get())
         verify = self.verify_var.get()
         clicked = 0
-        total = len(self.targets)
+        max_to_click = self.max_pixels_var.get()
+        targets_to_click = self.targets[:max_to_click]
+        total = len(targets_to_click)
 
         try:
-            for (x, y) in self.targets:
+            for (x, y) in targets_to_click:
                 if self._stop.is_set():
                     break
                 if verify and not pre_click_matches(x, y, rgb, tol):
