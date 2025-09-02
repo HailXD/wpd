@@ -6,6 +6,7 @@ Adaptive Color Clicker • v12
 - Clicks safe interior points (distance-transform maxima)
 - Color tolerance, preview, ESC to cancel, pre-click verification
 - NEW: Auto-hide the UI during Analyze/Click with configurable delay
+- NEW: Left/Right arrow keys adjust max clicks by ±1
 """
 
 import sys
@@ -97,9 +98,32 @@ class AdaptiveColorClicker:
 
         ttk.Label(cfg, text="Max clicks:").grid(row=4, column=0, sticky="e", padx=5, pady=4)
         self.max_pixels_var = tk.IntVar(value=9999)
-        self.max_pixels_slider = ttk.Scale(cfg, from_=1, to=9999, variable=self.max_pixels_var, orient="horizontal", length=160)
-        self.max_pixels_slider.grid(row=4, column=1, padx=5, pady=4)
-        ttk.Label(cfg, textvariable=self.max_pixels_var, width=5).grid(row=4, column=2, sticky="w")
+        
+        # Create a frame for the slider with arrow key bindings
+        slider_frame = ttk.Frame(cfg)
+        slider_frame.grid(row=4, column=1, padx=5, pady=4)
+        
+        self.max_pixels_slider = ttk.Scale(
+            slider_frame, 
+            from_=1, 
+            to=9999, 
+            variable=self.max_pixels_var, 
+            orient="horizontal", 
+            length=160,
+            command=lambda v: self._round_max_clicks()
+        )
+        self.max_pixels_slider.pack()
+        
+        # Bind arrow keys for fine control
+        self.max_pixels_slider.bind('<Left>', lambda e: self._adjust_max_clicks(-1))
+        self.max_pixels_slider.bind('<Right>', lambda e: self._adjust_max_clicks(1))
+        self.max_pixels_slider.bind('<Button-1>', lambda e: self.max_pixels_slider.focus_set())
+        
+        # Label showing current value
+        self.max_clicks_label = ttk.Label(cfg, width=5)
+        self.max_clicks_label.grid(row=4, column=2, sticky="w")
+        self.max_pixels_var.trace('w', self._update_max_clicks_label)
+        self._update_max_clicks_label()
 
         self.split_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(cfg, text="Split fused blocks adaptively", variable=self.split_var)\
@@ -147,6 +171,39 @@ class AdaptiveColorClicker:
 
         if not SCIPY_OK:
             self._append_info("Note: SciPy not found. Please `pip install scipy` for best accuracy.")
+
+    def _adjust_max_clicks(self, delta):
+        """Adjust max clicks by delta (±1), clamped to slider range"""
+        current = self.max_pixels_var.get()
+        new_val = current + delta
+        
+        # Get slider bounds
+        min_val = int(self.max_pixels_slider.cget('from'))
+        max_val = int(self.max_pixels_slider.cget('to'))
+        
+        # Clamp to range
+        new_val = max(min_val, min(new_val, max_val))
+        
+        self.max_pixels_var.set(new_val)
+        return "break"  # Prevent default behavior
+
+    def _round_max_clicks(self):
+        """Ensure max clicks is always a whole number"""
+        try:
+            current = float(self.max_pixels_var.get())
+            rounded = round(current)
+            if abs(current - rounded) > 0.01:  # Only update if actually different
+                self.max_pixels_var.set(rounded)
+        except Exception:
+            pass
+
+    def _update_max_clicks_label(self, *args):
+        """Update the label showing current max clicks value"""
+        try:
+            val = self.max_pixels_var.get()
+            self.max_clicks_label.config(text=str(val))
+        except Exception:
+            pass
 
     # Eyedropper
     def eyedropper(self):
@@ -429,13 +486,16 @@ class AdaptiveColorClicker:
         img = self.last_img.copy()
         draw = ImageDraw.Draw(img)
 
-        for (x, y) in self.targets:
+        max_to_show = self.max_pixels_var.get()
+        targets_to_show = self.targets[:max_to_show]
+
+        for i, (x, y) in enumerate(targets_to_show):
             draw.line((x-6, y, x+6, y), fill="red", width=2)
             draw.line((x, y-6, x, y+6), fill="red", width=2)
             draw.ellipse((x-2, y-2, x+2, y+2), fill="yellow", outline="black")
 
         win = tk.Toplevel(self.master)
-        win.title(f"Preview ({len(self.targets)} targets)")
+        win.title(f"Preview ({len(targets_to_show)} of {len(self.targets)} targets)")
         show = img.copy()
         show.thumbnail((1000, 800), Image.Resampling.LANCZOS)
         photo = ImageTk.PhotoImage(show)
@@ -449,7 +509,9 @@ class AdaptiveColorClicker:
             self.status.set("No targets to click. Run Analyze first.")
             return
         self._stop.clear()
-        self.status.set(f"Clicking {len(self.targets)} targets... (ESC to stop)")
+        
+        max_to_click = self.max_pixels_var.get()
+        self.status.set(f"Clicking {max_to_click} targets... (ESC to stop)")
 
         def on_press(key):
             if key == keyboard.Key.esc:
