@@ -889,7 +889,7 @@
         <div class="op-section" id="op-colors-section">
           <div class="op-section-title">
             <div class="op-title-left">
-              <span class="op-title-text">Color Distribution</span>
+              <span class="op-title-text">Color Toggle</span>
             </div>
             <div class="op-title-right">
               <button class="op-chevron" id="op-collapse-colors" title="Collapse/Expand">▾</button>
