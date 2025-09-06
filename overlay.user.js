@@ -2665,13 +2665,19 @@ async function updateColorDistributionUI() {
 
   function main() {
     loadConfig().then(() => {
-      injectStyles();
-
-      if (document.readyState === 'loading') window.addEventListener('DOMContentLoaded', createUI);
-      else createUI();
-
       ensureHook();
-      applyTheme();
+
+      const onDomReady = () => {
+        injectStyles();
+        createUI();
+        applyTheme();
+      };
+
+      if (document.readyState === 'loading') {
+        window.addEventListener('DOMContentLoaded', onDomReady);
+      } else {
+        onDomReady();
+      }
 
       console.log("Overlay Pro: Initialized with Minify (fixed 3×) mode.");
     });
